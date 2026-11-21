@@ -38,7 +38,18 @@ const E_EXTRA = bytes(',"extra":[');
 const K_TEXT = bytes('"text":"');
 const K_HEADER = bytes('"header":');
 
-let O = null; // the output bytes
+let O = null; // the output bytes: a window of the output file, flushed at record boundaries
+let fd = -1; // the output file
+const WINDOW = 1 << 18; // flush once a window holds this many bytes
+let windowLimit = WINDOW;
+let flushedInCase = false;
+
+/** Writes O[0, o) to the output file and returns the window's new start, 0. */
+function flushOut(o) {
+  fs.writeSync(fd, O, 0, o);
+  flushedInCase = true;
+  return 0;
+}
 let E = Buffer.allocUnsafe(1 << 22); // one case's errors, as JSON objects separated by commas (pages untouched until used)
 let eLen = 0;
 let odd = false; // a case whose text escapes a CSV special character as \u00XY is answered by solve.js
@@ -160,6 +171,7 @@ function transduce(I, s, e, header, o) {
   if (!header) o = put(o, T_NULL_ROWS);
 
   for (;;) {
+    if (o > windowLimit) o = flushOut(o); // between records, where nothing written can still be taken back
     // Lines with no characters (LF or CRLF alone) are no records.
     while (I[p] === BSLASH) {
       const d = I[p + 1];
@@ -443,65 +455,135 @@ for (let i = 0; i < 300; i += 1) {
   }
   WARM.push([text, (i & 1) === 0]);
 }
+// The warm-up writes through the same flush path as the real run (to the output file, which the real run then
+// truncates), with a tiny window so every flush branch has feedback too.
 O = Buffer.allocUnsafe(1 << 16);
+fd = fs.openSync(OUT, 'w');
 const warmUp = () => {
-  for (const [text, header] of WARM) {
-    const W = Buffer.from(JSON.stringify(text), 'utf8');
-    transduce(W, 1, W.length - 1, header, 0);
+  for (let i = 0; i < WARM.length; i += 1) {
+    // A handful of texts flush at every record (a few dozen writes in all); the rest never reach the window.
+    windowLimit = i < 6 ? 64 : WINDOW;
+    const W = Buffer.from(JSON.stringify(WARM[i][0]), 'utf8');
+    transduce(W, 1, W.length - 1, WARM[i][1], 0);
   }
 };
 for (let round = 0; round < 4; round += 1) warmUp();
-// Left to itself V8 runs the real input in its mid tier (Maglev) and finishes TurboFan only afterwards. So ask for
-// TurboFan now, on this thread, from the warm-up's feedback: the rules let an entry tune V8's flags. If the natives
-// syntax is refused, nothing changes but the speed.
+// Node 22 (V8 12.4, no Maglev) tiers transduce up to TurboFan on a background thread that tends to finish after the
+// real input has started, leaving it in baseline code and paying a second, OSR compile. So: compile the copy loops,
+// let any background job finish, and compile transduce now, on this thread, from the warm-up's feedback. The rules
+// let an entry tune V8's flags. If the natives syntax is refused, nothing changes but the speed.
 try {
   require('node:v8').setFlagsFromString('--allow-natives-syntax');
+  const T = Buffer.from('a"');
+  const U = Buffer.allocUnsafe(8);
   new Function(
     't',
     'a',
     'b',
-    '%PrepareFunctionForOptimization(a); %OptimizeFunctionOnNextCall(a);' +
-      '%PrepareFunctionForOptimization(b); %OptimizeFunctionOnNextCall(b);' +
-      '%PrepareFunctionForOptimization(t); %OptimizeMaglevOnNextCall(t);',
-  )(transduce, copyPlain, copyQuoted);
+    'T',
+    'U',
+    '%PrepareFunctionForOptimization(a); %OptimizeFunctionOnNextCall(a); a(T, U, 0, 0);' +
+      '%PrepareFunctionForOptimization(b); %OptimizeFunctionOnNextCall(b); b(T, U, 0, 0);' +
+      '%FinalizeOptimization(); %PrepareFunctionForOptimization(t); %OptimizeFunctionOnNextCall(t);',
+  )(transduce, copyPlain, copyQuoted, T, U);
   warmUp();
 } catch {
   // keep the default tiering
 }
+fs.closeSync(fd);
 
-const I = fs.readFileSync(IN);
-O = Buffer.allocUnsafe(3 * I.length + (1 << 16));
-let o = 0;
-O[o++] = 0x5b;
-let at = 0;
-let first = true;
-for (;;) {
-  const k = I.indexOf(K_TEXT, at);
-  if (k < 0) break;
-  const s = k + K_TEXT.length;
-  const objStart = I.lastIndexOf(0x7b, k);
-  const hk = I.indexOf(K_HEADER, objStart);
-  let e;
-  if (hk > s && I[hk - 1] === COMMA && I[hk - 2] === QUOTE) e = hk - 2;
-  else {
-    // The text's end found the slow way: the first quote not escaped by an odd run of backslashes.
-    e = s;
-    for (;;) {
-      e = I.indexOf(QUOTE, e);
-      let b = 0;
-      while (I[e - 1 - b] === BSLASH) b += 1;
-      if ((b & 1) === 0) break;
-      e += 1;
-    }
+// The input is read case by case into one window that is reused (and grown only if a case needs more), so the
+// pages touched for input stay about one case's worth instead of the whole file's.
+let W = Buffer.allocUnsafe(1 << 22);
+let wLen = 0; // bytes of W holding input
+let eof = false;
+let fdIn = -1;
+
+/** Keeps W[from, wLen) (moved to the start of W) and reads more of the input after it. */
+function refill(from) {
+  if (from > 0) {
+    W.copyWithin(0, from, wLen);
+    wLen -= from;
   }
-  const header = hk >= 0 && I[hk + K_HEADER.length] === 0x74;
-  if (!first) O[o++] = COMMA;
-  first = false;
-  const start = o;
-  o = transduce(I, s, e, header, o);
-  if (odd) o = viaSolve(I, s, e, header, start);
-  at = e + 1;
+  if (wLen === W.length) {
+    const next = Buffer.allocUnsafe(W.length * 2);
+    W.copy(next, 0, 0, wLen);
+    W = next;
+  }
+  const n = fs.readSync(fdIn, W, wLen, W.length - wLen, null);
+  if (n === 0) eof = true;
+  else wLen += n;
 }
-growO(o, 1);
-O[o++] = 0x5d;
-fs.writeFileSync(OUT, O.subarray(0, o));
+
+/**
+ * Writes every case's answer. With `stream`, the output is flushed in windows at record boundaries, so only the
+ * first window's pages of O are ever touched. Returns false if a case needed solve.js after part of it was already
+ * flushed: the caller then writes everything again without streaming.
+ */
+function writeAll(stream) {
+  fdIn = fs.openSync(IN, 'r');
+  wLen = 0;
+  eof = false;
+  refill(0);
+  fd = fs.openSync(OUT, 'w');
+  windowLimit = stream ? WINDOW : Infinity;
+  O = Buffer.allocUnsafe(3 * W.length + (1 << 16));
+  let o = 0;
+  O[o++] = 0x5b;
+  let at = 0;
+  let first = true;
+  for (;;) {
+    const I = W.subarray(0, wLen);
+    const k = I.indexOf(K_TEXT, at);
+    if (k < 0) {
+      if (eof) break;
+      refill(at);
+      at = 0;
+      continue;
+    }
+    const s = k + K_TEXT.length;
+    const objStart = I.lastIndexOf(0x7b, k);
+    const hk = I.indexOf(K_HEADER, objStart);
+    let e;
+    if (hk > s && I[hk - 1] === COMMA && I[hk - 2] === QUOTE && hk + K_HEADER.length < wLen) e = hk - 2;
+    else if (!eof) {
+      // This case's text does not end inside the window yet: read on, keeping it, and look again.
+      refill(at);
+      at = 0;
+      continue;
+    } else {
+      // The text's end found the slow way: the first quote not escaped by an odd run of backslashes.
+      e = s;
+      for (;;) {
+        e = I.indexOf(QUOTE, e);
+        let b = 0;
+        while (I[e - 1 - b] === BSLASH) b += 1;
+        if ((b & 1) === 0) break;
+        e += 1;
+      }
+    }
+    const header = hk >= 0 && I[hk + K_HEADER.length] === 0x74;
+    if (!first) O[o++] = COMMA;
+    first = false;
+    const start = o;
+    flushedInCase = false;
+    o = transduce(I, s, e, header, o);
+    if (odd) {
+      if (flushedInCase) {
+        fs.closeSync(fd);
+        fs.closeSync(fdIn);
+        return false;
+      }
+      o = viaSolve(I, s, e, header, start);
+    }
+    at = e + 1;
+  }
+  growO(o, 1);
+  O[o++] = 0x5d;
+  flushOut(o);
+  fs.closeSync(fd);
+  fs.closeSync(fdIn);
+  return true;
+}
+
+if (!writeAll(true)) writeAll(false);
